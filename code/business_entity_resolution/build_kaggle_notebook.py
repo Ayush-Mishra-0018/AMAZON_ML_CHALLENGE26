@@ -13,7 +13,7 @@ Single notebook: data -> normalisation -> record-centric blocking -> stage-1 Lig
 
 ## How to run on Kaggle
 1. **Add the data:** *Add Input -> Upload* the challenge folder (the one containing `train/` and `test/`) as a Kaggle Dataset and attach it. The notebook finds it automatically under `/kaggle/input`.
-2. **Settings:** Accelerator **None (CPU)** (no GPU is used). **Internet: On** (only needed if `rapidfuzz`/`text-unidecode` are not pre-installed).
+2. **Settings:** Accelerator **GPU (T4/P100)** and **Internet: On**. Stages 1-2 are CPU-only; the GPU is used only by the stage-3 foundation-model encoders (downloaded once from Hugging Face). With `USE_FM = False`, or no Internet, stage 3 falls back to structural features and a CPU session is enough.
 3. **First run `RUN_MODE = "smoke"`** (next cell): a few minutes, exercises every code path including France. Then set `RUN_MODE = "full"` and use **Save Version -> Save & Run All (Commit)** so it runs in the background (up to 12 h). Outputs land in `/kaggle/working/output/`.
 4. If a session dies, just run again: trained models and finished countries are **checkpointed** and skipped.
 
@@ -30,12 +30,19 @@ MIN_VAL_F05 = 0.90          # ACCURACY GATE: refuse to write submission unless v
 N_TRAIN_S1 = {"US": 150_000, "India": 150_000}   # S1 entities per country in the training universe (full mode)
 RESUME = True               # reuse saved models / finished-country checkpoints if present
 SEED = 0
+DESIGN = "v3_stage3"        # bump when the training design changes; older saved models are then retrained automatically
+# ---- stage 3 (ambiguous-band re-scorer). Every piece is validated against a control and enabled ONLY if it earns its place.
+USE_FM = True               # try foundation-model features (multilingual embeddings). Needs Internet ON + GPU for the full run.
+FM_KEYS = ["e5", "labse"]   # two different encoders: errors of one may be fixed by the other (complementarity is measured)
+BAND = (0.05, 0.97)         # stage-2 probability range treated as "ambiguous" (about 0.4% of pairs but ~80% of the errors)
+MIN_GAIN = 0.002            # a stage-3 variant must beat its control by this much validation F0.5 to be enabled
+MAX_BAND_INFER = 4_000_000  # safety cap on ambiguous pairs re-scored at inference (keeps those closest to the threshold)
 ''')
 
 code(r'''
 import os, sys, json, time, zlib, gc, itertools, re, csv, threading, subprocess, shutil, multiprocessing as mp
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 import numpy as np, pandas as pd
 
@@ -50,7 +57,8 @@ for d in (WORK, OUT, WORK / "ckpt", WORK / "models", WORK / "cache", WORK / "ind
 class Params:
     cap_frac: float = 3e-5          # a key is usable if shared by <= max(cap_min, cap_frac * n_S1) S1 records
     cap_min: int = 8
-    top_k_per_record: int = 8       # S1 candidates kept per S2/S3 record (ranked by key score)
+    top_k_per_record: int = 8       # S1 candidates kept per S2/S3 record at INFERENCE (auto-set from the recall@K curve after training)
+    top_k_train: int = 16           # candidates kept per record during TRAINING, to measure recall@K and pick the smallest safe K
     chunk_records: int = 400_000    # pool records per pass (bounds RAM)
     task_records: int = 8_000       # pool records per worker task
     n_workers: int = max(1, os.cpu_count() or 2)
@@ -58,6 +66,8 @@ class Params:
     lgb1: dict = field(default_factory=lambda: dict(n_estimators=250, learning_rate=0.06, num_leaves=63, min_child_samples=40,
                                                     subsample=0.8, subsample_freq=1, colsample_bytree=0.8, verbose=-1))
     lgb2: dict = field(default_factory=lambda: dict(n_estimators=200, learning_rate=0.05, num_leaves=31, min_child_samples=30, verbose=-1))
+    lgb3: dict = field(default_factory=lambda: dict(n_estimators=300, learning_rate=0.05, num_leaves=31, min_child_samples=30,
+                                                    subsample=0.8, subsample_freq=1, colsample_bytree=0.8, verbose=-1))
     n_folds: int = 3
     plateau_tol: float = 0.001      # choose the HIGHEST threshold within tol of the best OOF F0.5 (precision insurance)
     one_owner: bool = False         # measured ~neutral in prototype -> off
@@ -81,6 +91,14 @@ def _need(mod, pip):
         subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", pip])
 for m, p in (("rapidfuzz", "rapidfuzz"), ("text_unidecode", "text-unidecode"), ("lightgbm", "lightgbm"), ("pyarrow", "pyarrow")):
     _need(m, p)
+if USE_FM:                                    # optional: if this fails the notebook simply runs without foundation models
+    try:
+        _need("sentence_transformers", "sentence-transformers")
+        import torch
+        print("torch", torch.__version__, "| GPU available:", torch.cuda.is_available())
+    except Exception as e:
+        print("foundation-model stack unavailable, stage 3 will use structural features only:", e)
+        USE_FM = False
 import lightgbm as lgb
 from rapidfuzz import fuzz, process
 try:
@@ -354,6 +372,7 @@ class Records:
     """Normalised array-backed view of one side (S1 or pool)."""
     def __init__(self, df):
         self.ids = df.entity_id.values
+        self.raw_n, self.raw_a = df.business_name.values, df.business_address.values     # raw text (scripts/diacritics) for the embedding models
         self.nn = [W.norm(x) for x in df.business_name]
         self.na = [W.norm(x) for x in df.business_address]
         self.sk = [W.skeleton(x) for x in self.nn]
@@ -443,15 +462,19 @@ class BlockingEngine:
     def close(self):
         self.pool.terminate()
 
-def candidate_pairs_for(S1, Pl, params, pool_df, s1_df, on_chunk):
-    """Blocking + stage-1 features per chunk of pool records; on_chunk(pairs, feats) consumes each chunk."""
+def candidate_pairs_for(S1, Pl, params, pool_df, s1_df, on_chunk, keep_s1=None):
+    """Blocking + stage-1 features per chunk of pool records; on_chunk(pairs, feats) consumes each chunk.
+    keep_s1 (optional bool array over S1 rows): keep only pairs of these S1 BEFORE computing features. The candidate
+    scan still runs against the FULL S1 index, so ncand_rec/kgap/kshare are exactly what they are at test time."""
     eng = BlockingEngine(s1_df.business_name, s1_df.business_address, params)
     try:
         log(f"   index ready: {eng.n_s1:,} S1, {eng.n_keys / 1e6:.1f}M keys, key-frequency cap = {eng.cap}")
         n_chunks = (len(pool_df) + params.chunk_records - 1) // params.chunk_records
         total, t0 = 0, time.time()
         for ci, pairs in enumerate(eng.stream(pool_df.business_name, pool_df.business_address), 1):
-            if pairs is None:
+            if pairs is not None and keep_s1 is not None:
+                pairs = pairs[keep_s1[pairs.s1_i.values]].reset_index(drop=True)
+            if pairs is None or len(pairs) == 0:
                 log(f"   chunk {ci}/{n_chunks}: no candidates"); continue
             with stage(f"chunk {ci}/{n_chunks}: {len(pairs):,} pair features + scoring"):
                 on_chunk(pairs, pair_features(pairs, S1, Pl, eng.cap))
@@ -534,32 +557,199 @@ print("metric self-test passed")
 
 # ----------------------------------------------------------------------------------------------------------------
 md("""
+## 6b. Stage 3: ambiguous-band re-scorer (structural features + two foundation models)
+**Why:** in the measured error analysis, the ambiguous band (stage-2 p between 0.05 and 0.97) is ~0.4% of pairs but holds ~80% of the errors. That makes an expensive model affordable there (a few million pairs), while stage 1/2 handle the rest.
+**Structural band features** (cheap, no download): IDF-weighted token mismatch (a missing *rare* token means a different business, a missing filler word like "Center" does not) for names, phonetic skeletons and addresses, plus a house-number difference profile (last-digit-only change, leading digit dropped, suffix relation, edit distance).
+**Foundation models** (only if Internet + GPU): frozen multilingual encoders, `intfloat/multilingual-e5-small` and `sentence-transformers/LaBSE`, cosine similarity of name and of address on the RAW text (native scripts included). *Licences: I believe MIT and Apache-2.0 respectively (both far below 8B parameters) but please verify on the model cards.*
+**Nothing is trusted blindly.** The validation compares: baseline stage 2, control A (structural features only), B (+e5), C (+LaBSE), D (+both). A variant is enabled only if it beats its control by `MIN_GAIN` on out-of-fold validation at test density; otherwise stage 3 is switched off (or falls back to A). The chosen mode is stored with the model.
+""")
+code(r'''
+from collections import Counter
+from rapidfuzz.distance import Levenshtein
+
+BAND_F = [f"{p}_{k}" for p in ("n", "k", "a") for k in ("com", "mis", "ext", "maxmis", "maxext", "jac")] + \
+         ["hn_min_edit", "hn_exact", "hn_suffix", "hn_lastdigit", "hn_missing", "hn_ncommon", "hn_nA", "hn_nB", "hn_onlyA", "hn_onlyB"]
+
+def token_idf(S1):
+    """Token document frequencies over the S1 side of a country (names, phonetic skeletons, addresses)."""
+    out = {"N": len(S1.nn)}
+    for key, lst in (("n", S1.nn), ("k", S1.sk), ("a", S1.na)):
+        c = Counter()
+        for s in lst:
+            c.update(set(s.split()))
+        out[key] = c
+    return out
+
+def _idf_feats(a_tok, b_tok, cnt, N):
+    A, B, ln = set(a_tok), set(b_tok), np.log(N + 1.0)
+    idf = lambda t: np.log((N + 1.0) / (cnt.get(t, 0) + 1.0)) / ln
+    com = sum(idf(t) for t in A & B)
+    mis, ext = [idf(t) for t in A - B], [idf(t) for t in B - A]
+    ms, es = sum(mis), sum(ext)
+    return [com, ms, es, max(mis) if mis else 0.0, max(ext) if ext else 0.0, com / (com + ms + es + 1e-9)]
+
+def band_features(s_idx, p_idx, S1, Pl, idf):
+    """Structural features for ambiguous pairs. Rare-token contradictions and house-number differences."""
+    X = np.zeros((len(s_idx), len(BAND_F)), np.float32)
+    for i, (s, p) in enumerate(zip(s_idx, p_idx)):
+        row = []
+        for key, a, b in (("n", S1.nn[s], Pl.nn[p]), ("k", S1.sk[s], Pl.sk[p]), ("a", S1.na[s], Pl.na[p])):
+            row.extend(_idf_feats(a.split(), b.split(), idf[key], idf["N"]))
+        A, B = S1.nums[s], Pl.nums[p]
+        if A and B:
+            me = min(Levenshtein.distance(x, y) for x in A for y in B)
+            suf = float(any(x != y and (x.endswith(y) or y.endswith(x)) for x in A for y in B))
+            ld = float(any(len(x) == len(y) and x != y and x[:-1] == y[:-1] for x in A for y in B))
+            row.extend([me, float(bool(A & B)), suf, ld, 0.0, len(A & B), len(A), len(B), len(A - B), len(B - A)])
+        else:
+            row.extend([-1, -1, -1, -1, 1.0, 0, len(A), len(B), len(A), len(B)])
+        X[i] = row
+    return pd.DataFrame(X, columns=BAND_F)
+
+# ---------------- foundation models (frozen encoders) ----------------
+FM_SPECS = {"e5": ("intfloat/multilingual-e5-small", "query: "), "labse": ("sentence-transformers/LaBSE", "")}
+
+def load_fm(key):
+    import torch
+    from sentence_transformers import SentenceTransformer
+    dev = "cuda" if torch.cuda.is_available() else "cpu"
+    m = SentenceTransformer(FM_SPECS[key][0], device=dev)
+    if dev == "cuda":
+        m.half()
+    m.max_seq_length = 64
+    log(f"   loaded {FM_SPECS[key][0]} on {dev}")
+    return m
+
+def fm_cos(model, prefix, sa, sb, empty_b=None, chunk=100_000):
+    """Cosine similarity of aligned string arrays; every distinct string is embedded once."""
+    n = len(sa)
+    codes, uniq = pd.factorize(np.concatenate([np.asarray(sa, dtype=object), np.asarray(sb, dtype=object)]))
+    texts = [prefix + str(u) for u in uniq]
+    prog, parts = Progress(len(texts), "embedding", every=20.0, unit=" str"), []
+    for j in range(0, len(texts), chunk):
+        parts.append(model.encode(texts[j:j + chunk], batch_size=512, convert_to_numpy=True, normalize_embeddings=True,
+                                  show_progress_bar=False).astype(np.float16))
+        prog.update(min(chunk, len(texts) - j))
+    E = np.concatenate(parts) if parts else np.zeros((0, 1), np.float16)
+    out = np.empty(n, np.float32)
+    for i in range(0, n, 1_000_000):
+        a = E[codes[i:i + 1_000_000]].astype(np.float32); b = E[codes[n + i:n + i + 1_000_000]].astype(np.float32)
+        out[i:i + len(a)] = (a * b).sum(1)
+    if empty_b is not None:
+        out[empty_b] = -1.0
+    return out
+
+def fm_features(key, model, s_idx, p_idx, S1, Pl):
+    prefix = FM_SPECS[key][1]
+    cn = fm_cos(model, prefix, S1.raw_n[s_idx], Pl.raw_n[p_idx])
+    ca = fm_cos(model, prefix, S1.raw_a[s_idx], Pl.raw_a[p_idx], empty_b=Pl.empty_a[p_idx])
+    return pd.DataFrame({f"cos_{key}_name": cn, f"cos_{key}_addr": ca})
+
+def train_stage3(S, C, params, n_all, ntrue_all, sc2_base, rep):
+    """Fits/validates the band re-scorer variants. Mutates S['p2'] to the final (stage-2 or stage-3) score. Returns the decision."""
+    lo, hi = BAND
+    bmask = ((S.p2 >= lo) & (S.p2 <= hi)).values
+    Bd = S[bmask]
+    log(f"   ambiguous band [{lo}, {hi}]: {bmask.sum():,} of {len(S):,} survivor rows ({100 * bmask.mean():.1f}%), "
+        f"{Bd.y.mean():.3f} of them true pairs")
+    cidx = {c["country"]: c for c in C}
+    with stage("structural band features (idf-weighted mismatch + house-number profile)"):
+        frames = []
+        for cn, c in cidx.items():
+            sub = Bd[Bd.country.values == cn]
+            f = band_features(sub.s1f.values, sub.pool_i.values, c["S1"], c["P"], token_idf(c["S1"])); f.index = sub.index
+            frames.append(f)
+        bf = pd.concat(frames).loc[Bd.index]
+    base_cols = pd.concat([Bd[STAGE2 + ["p2"]], bf], axis=1)
+    variants = {"A_structural": base_cols}
+    fm_ok = []
+    if USE_FM:
+        for key in FM_KEYS:
+            try:
+                model = load_fm(key)
+                with stage(f"embedding band pairs with {FM_SPECS[key][0]}"):
+                    frames = []
+                    for cn, c in cidx.items():
+                        sub = Bd[Bd.country.values == cn]
+                        f = fm_features(key, model, sub.s1f.values, sub.pool_i.values, c["S1"], c["P"]); f.index = sub.index
+                        frames.append(f)
+                    variants[f"+{key}"] = pd.concat([base_cols, pd.concat(frames).loc[Bd.index]], axis=1)
+                    fm_ok.append(key)
+                del model; gc.collect()
+            except Exception as e:
+                log(f"   foundation model {key} unavailable ({type(e).__name__}: {e}); continuing without it")
+        if len(fm_ok) == 2:
+            variants["+both"] = pd.concat([variants[f"+{fm_ok[0]}"], variants[f"+{fm_ok[1]}"].filter(like="cos_")], axis=1)
+    res = {}
+    for name, X in variants.items():
+        pb = _oof(X.to_numpy(np.float32), Bd.y.values, Bd.fold.values, params.lgb3, params.n_folds, f"stage 3 [{name}]")
+        pfin = S.p2.values.copy(); pfin[bmask] = pb
+        sc = scan_thresholds(S.gs1.values, pfin, S.y.values, n_all, ntrue_all)
+        res[name] = (max(sc.values()), pfin, X.columns.tolist())
+        log(f"   variant {name:14s}: best OOF F0.5 {res[name][0]:.4f}   (stage-2 baseline {max(sc2_base.values()):.4f})")
+    base = max(sc2_base.values()); ctrl = res["A_structural"][0]
+    fm_names = [n for n in res if n != "A_structural"]
+    best_fm = max(fm_names, key=lambda n: res[n][0]) if fm_names else None
+    if best_fm and res[best_fm][0] >= ctrl + MIN_GAIN and res[best_fm][0] >= base + MIN_GAIN:
+        choice = best_fm
+    elif ctrl >= base + MIN_GAIN:
+        choice = "A_structural"
+    else:
+        choice = None
+    log("   STAGE-3 DECISION: " + ("disabled (no variant beat its control by MIN_GAIN)" if choice is None else
+        f"enabled variant {choice} (F0.5 {res[choice][0]:.4f} vs baseline {base:.4f}, control {ctrl:.4f})"))
+    meta = {"mode": "none", "band": [lo, hi], "variants": {n: v[0] for n, v in res.items()}, "baseline": base}
+    if choice is not None:
+        meta.update(mode="fm" if choice != "A_structural" else "structural", feat3=res[choice][2],
+                    fm={"+e5": ["e5"], "+labse": ["labse"], "+both": fm_ok}.get(choice, []), choice=choice)
+        S["p2_stage2"] = S.p2.values
+        S["p2"] = res[choice][1]
+        with stage("fitting final stage-3 model"):
+            m3 = lgb.LGBMClassifier(**params.lgb3, random_state=SEED, n_jobs=os.cpu_count()).fit(
+                variants[choice].to_numpy(np.float32), Bd.y.values)
+        m3.booster_.save_model(str(WORK / "models" / "stage3.txt"))
+    rep["stage3"] = meta
+    return meta
+log("stage-3 helpers ready")
+''')
+
+md("""
 ## 7. Train + validate (accuracy-gated)
-Builds cluster-closed universes, runs the real blocking + features, produces **grouped out-of-fold** predictions (grouped by S1 name, so same-name chains never straddle folds), and reports the decomposition: **candidate recall**, the **ceiling** (F0.5 with a perfect scorer inside the candidate set), stage-1, stage-2, per country, singletons vs non-singletons.
+**v2 (test-density) design:** the S1 index is the FULL country S1 set and the pool is the FULL country pool, so every decoy and every "record owned by a similar other S1" is present as at test time; only a sample of S1 entities is kept for training/validation. (v1 used small cluster-closed universes: it validated at 0.98 but scored 0.915 on the leaderboard because ~89% of the hard decoys were missing.) It also measures **recall@K** to choose the smallest safe candidate budget K per S2/S3 record, because the organisers rank smaller candidate sets higher.
+Runs the real blocking + features, produces **grouped out-of-fold** predictions (grouped by S1 name, so same-name chains never straddle folds), and reports the decomposition: **candidate recall**, the **ceiling** (F0.5 with a perfect scorer inside the candidate set), stage-1, stage-2, per country, singletons vs non-singletons.
 """)
 code(r'''
 def build_training_country(s1, pool, own, country, n_s1, params):
+    """TEST-DENSITY training/validation data.
+    The S1 index is the FULL country S1 set and the pool is the FULL country pool, so every decoy, every same-name
+    sibling and every 'record owned by a similar OTHER S1' is present exactly as at test time. Only the rows of a
+    random sample T of S1 entities are kept (bounds RAM/time); their labels and macro-F0.5 denominators are complete.
+    (The earlier cluster-closed sample dropped ~89% of the hard decoys and validated at 0.98 vs 0.915 on the leaderboard.)"""
     banner(f"TRAIN DATA: {country}")
-    pick, upool, truth = make_universe(s1, pool, own, country, n_s1, SEED)
-    log(f"   universe: {len(pick):,} S1, {len(upool):,} S2/S3, {sum(len(t) for t in truth.values()):,} true pairs")
-    with stage("normalising records"):
-        S1, Pl = Records(pick), Records(upool)
-    s1_index = {e: i for i, e in enumerate(pick.entity_id)}
-    pid = {e: i for i, e in enumerate(upool.entity_id)}
-    owner = np.full(len(upool), -1, np.int64)
-    for e, T in truth.items():
-        for m in T:
-            owner[pid[m]] = s1_index[e]
-    ntrue = np.array([len(truth[e]) for e in pick.entity_id])
+    s1c = s1[s1.country == country].reset_index(drop=True)
+    pc = pool[pool.country == country].reset_index(drop=True)
+    rng = np.random.RandomState(SEED)
+    T = np.sort(rng.choice(len(s1c), min(n_s1, len(s1c)), replace=False))
+    t_index = np.full(len(s1c), -1, np.int64); t_index[T] = np.arange(len(T))
+    s1_pos = pd.Series(np.arange(len(s1c)), index=s1c.entity_id.values)
+    owner_full = pc.entity_id.map(own).map(s1_pos).fillna(-1).astype(np.int64).values     # pool row -> owning S1 row (-1 = orphan)
+    ntrue = np.bincount(owner_full[owner_full >= 0], minlength=len(s1c))[T]
+    log(f"   FULL index: {len(s1c):,} S1 | FULL pool: {len(pc):,} records ({(owner_full < 0).mean():.3f} orphans) | "
+        f"evaluating on {len(T):,} sampled S1 ({(ntrue == 0).mean():.3f} singletons, {ntrue.mean():.2f} matches/S1)")
+    with stage("normalising records (full S1 + full pool)"):
+        S1, Pl = Records(s1c), Records(pc)
     parts = []
-    candidate_pairs_for(S1, Pl, params, upool, pick, lambda pr, f: parts.append(pd.concat([pr[["s1_i", "pool_i"]], f], axis=1)))
+    candidate_pairs_for(S1, Pl, params, pc, s1c, lambda pr, f: parts.append(pd.concat([pr[["s1_i", "pool_i"]], f], axis=1)),
+                        keep_s1=(t_index >= 0))
     D = pd.concat(parts, ignore_index=True)
-    D["y"] = (owner[D.pool_i.values] == D.s1_i.values).astype(np.int8)
-    fold = np.array([zlib.crc32(x.encode()) % params.n_folds for x in S1.nn])
-    D["fold"], D["country"] = fold[D.s1_i.values], country
-    log(f"   RESULT {country}: {len(D):,} candidate pairs ({len(D) / len(pick):.0f}/S1) | true pairs captured by blocking "
-        f"{D.y.sum():,}/{ntrue.sum():,} = {D.y.sum() / ntrue.sum():.4f}")
-    return dict(country=country, P=Pl, D=D, ntrue=ntrue, n_s1=len(pick))
+    D["y"] = (owner_full[D.pool_i.values] == D.s1_i.values).astype(np.int8)
+    fold_full = np.array([zlib.crc32(x.encode()) % params.n_folds for x in S1.nn])      # grouped by S1 name
+    D["fold"], D["country"] = fold_full[D.s1_i.values], country
+    D["s1f"] = D.s1_i.values                                                             # index into the FULL S1 (for stage-3 text features)
+    D["s1_i"] = t_index[D.s1_i.values]                                                   # remap to the sampled-S1 index
+    log(f"   RESULT {country}: {len(D):,} candidate rows for sampled S1 ({len(D) / len(T):.0f}/S1, top-{params.top_k_per_record} per record) | "
+        f"true pairs captured by blocking {D.y.sum():,}/{ntrue.sum():,} = {D.y.sum() / ntrue.sum():.4f}")
+    return dict(country=country, P=Pl, S1=S1, D=D, ntrue=ntrue, n_s1=len(T))
 
 def _oof(X, y, fold, prm, n_folds, name):
     p = np.zeros(len(X), np.float32)
@@ -576,13 +766,23 @@ def train(params):
     s1, pool, gt = load_split("train")
     own = owner_map(gt)
     banner("2/5: blocking + features per country")
-    C = [build_training_country(s1, pool, own, c, n, params) for c, n in N_TRAIN_S1.items()]
+    ptrain = replace(params, top_k_per_record=params.top_k_train)      # keep more candidates while training, to measure recall@K
+    C = [build_training_country(s1, pool, own, c, n, ptrain) for c, n in N_TRAIN_S1.items()]
     del s1, pool, gt, own; gc.collect()
     D = pd.concat([c["D"] for c in C], ignore_index=True)
     off = np.cumsum([0] + [c["n_s1"] for c in C])
     D["gs1"] = D.s1_i.values + np.repeat(off[:-1], [len(c["D"]) for c in C])
     ntrue_all, n_all = np.concatenate([c["ntrue"] for c in C]), int(off[-1])
-    rep = {"candidate_recall_pairs": float(D.y.sum() / ntrue_all.sum())}
+
+    # ---- candidate-set size: recall@K. The organisers rank SMALLER candidate sets higher, so use the smallest safe K.
+    posk = D.loc[D.y == 1, "krank"].values
+    curve = {k: float((posk < k).sum() / ntrue_all.sum()) for k in range(1, params.top_k_train + 1)}
+    table("   pair recall@K (K = S1 candidates kept per S2/S3 record):", curve)
+    K_FINAL = next(k for k in range(1, params.top_k_train + 1) if curve[k] >= curve[params.top_k_train] - 0.002)
+    log(f"   chosen K = {K_FINAL} (loses <= 0.2% of the pairs that recall@{params.top_k_train} reaches)")
+    D = D[D.krank < K_FINAL].reset_index(drop=True)
+    rep = {"design": DESIGN, "k_final": int(K_FINAL), "recall_at_k": curve, "candidate_recall_pairs": float(D.y.sum() / ntrue_all.sum())}
+    log(f"   {len(D):,} training rows after K filter | mean candidates/S1 = {len(D) / n_all:.1f}")
     pos = D[D.y == 1]
     rep["ceiling_F05"] = float(macro_f05(pos.gs1.values, np.ones(len(pos)), n_all, ntrue_all).mean())
     log(f"   COMBINED: {len(D):,} pairs | candidate recall {rep['candidate_recall_pairs']:.4f} | ceiling F0.5 (perfect scorer) {rep['ceiling_F05']:.4f}")
@@ -604,6 +804,11 @@ def train(params):
             r = relational_features(sub, c["P"]); r.index = idx; rel.append(r)
     S = S.join(pd.concat(rel))
     S["p2"] = _oof(S[STAGE2].to_numpy(np.float32), S.y.values, S.fold.values, params.lgb2, params.n_folds, "stage 2")
+    sc2_base = scan_thresholds(S.gs1.values, S.p2.values, S.y.values, n_all, ntrue_all)
+    rep["stage2_base_by_threshold"] = sc2_base
+    log(f"   stage-2 baseline best F0.5 = {max(sc2_base.values()):.4f}")
+    banner("4b/5: stage-3 ambiguous-band re-scorer (validated against controls)")
+    S3 = train_stage3(S, C, params, n_all, ntrue_all, sc2_base, rep)          # may replace S['p2'] by the final score
     sc2 = scan_thresholds(S.gs1.values, S.p2.values, S.y.values, n_all, ntrue_all)
     th, best = choose_threshold(sc2, params.plateau_tol)
     rep.update(stage2_by_threshold=sc2, threshold=th, stage2_at_threshold=sc2[th], stage2_best=best)
@@ -635,10 +840,16 @@ def train(params):
     return rep
 
 META = WORK / "models" / "meta.json"
-if RESUME and META.exists():
-    REPORT = json.loads(META.read_text())["report"]; log("RESUME: loaded saved models + validation report (delete work/models to retrain)")
+_old = json.loads(META.read_text())["report"] if META.exists() else {}
+if RESUME and META.exists() and _old.get("design") == DESIGN:
+    REPORT = _old; log("RESUME: loaded saved models + validation report (delete work/models to retrain)")
 else:
+    if META.exists():
+        log(f"saved models are from an older design ({_old.get('design')!r} != {DESIGN!r}): retraining")
     REPORT = train(P)
+P.top_k_per_record = REPORT["k_final"]                        # inference candidate budget chosen from the recall@K curve
+MODEL_TAG = str(int(META.stat().st_mtime))                     # checkpoints are tied to THIS model, so stale ones are never reused
+log(f"inference will keep the top-{P.top_k_per_record} S1 candidates per S2/S3 record | model tag {MODEL_TAG}")
 ''')
 
 code(r'''
@@ -665,7 +876,7 @@ France has no labels; compare its printed **predicted singleton rate** and **mat
 """)
 code(r'''
 def infer_country(country, s1, pool, b1, b2, th, params):
-    ck_m, ck_c, ck_d = (WORK / "ckpt" / f"{country}_{k}" for k in ("matches.parquet", "cands.parquet", "diag.json"))
+    ck_m, ck_c, ck_d = (WORK / "ckpt" / f"{country}_{MODEL_TAG}_{k}" for k in ("matches.parquet", "cands.parquet", "diag.json"))
     if RESUME and ck_m.exists() and ck_c.exists() and ck_d.exists():
         log(f"[{country}] checkpoint found, skipping"); return json.loads(ck_d.read_text())
     s1c = s1[s1.country == country].reset_index(drop=True)
@@ -688,11 +899,30 @@ def infer_country(country, s1, pool, b1, b2, th, params):
         with stage("stage 2: consensus features + scoring"):
             R = R.join(relational_features(R[["s1_i", "pool_i", "p1", "isS2"]], Pl))
             R["p2"] = b2.predict(R[STAGE2].to_numpy(np.float32))
-        sel = R[R.p2 >= th]
+        pf = R.p2.values.copy()                                    # final score = stage 2, replaced by stage 3 inside the ambiguous band
+        if S3["mode"] != "none":
+            lo, hi = S3["band"]; idx = np.flatnonzero((pf >= lo) & (pf <= hi))
+            if len(idx) > MAX_BAND_INFER:                          # safety cap: keep the pairs closest to the decision threshold
+                idx = idx[np.argsort(np.abs(pf[idx] - th))[:MAX_BAND_INFER]]
+            sub = R.iloc[idx]
+            with stage(f"stage 3 ({S3['mode']}) on {len(idx):,} ambiguous pairs"):
+                X3 = pd.concat([sub[STAGE2 + ["p2"]].reset_index(drop=True),
+                                band_features(sub.s1_i.values, sub.pool_i.values, S1, Pl, token_idf(S1))], axis=1)
+                for kf in S3.get("fm", []):
+                    X3 = pd.concat([X3, fm_features(kf, FM[kf], sub.s1_i.values, sub.pool_i.values, S1, Pl)], axis=1)
+                pf[idx] = B3.predict(X3[S3["feat3"]].to_numpy(np.float32))
+        R["pf"] = pf
+        # persist every scored survivor so thresholds / decision rules can be re-decided OFFLINE (minutes, not hours)
+        pd.DataFrame({"s1_id": S1.ids[R.s1_i.values], "pool_id": Pl.ids[R.pool_i.values], "p1": R.p1.values.astype(np.float32),
+                      "p2": R.p2.values.astype(np.float32), "pf": R.pf.values.astype(np.float32), "isS2": R.isS2.values,
+                      "numeq": R.numeq.values, "aempty": R.aempty.values, "ncand_rec": R.ncand_rec.values,
+                      "kgap": R.kgap.values, "krank": R.krank.values}
+                     ).to_parquet(WORK / "ckpt" / f"{country}_{MODEL_TAG}_survivors.parquet")
+        sel = R[R.pf >= th]
         if params.one_owner:
-            sel = sel.loc[sel.groupby("pool_i").p2.idxmax()]
+            sel = sel.loc[sel.groupby("pool_i").pf.idxmax()]
     else:
-        sel = R.assign(p2=[])
+        sel = R.assign(pf=[])
     with stage("assembling per-S1 lists and saving checkpoint"):
         def lists(df):
             if not len(df): return pd.DataFrame({"s1_id": [], "ids": []})
@@ -717,6 +947,15 @@ banner("INFERENCE (1: load test data + models)")
 TS1, TPOOL, _ = load_split("test")
 B1 = lgb.Booster(model_file=str(WORK / "models" / "stage1.txt")); B2 = lgb.Booster(model_file=str(WORK / "models" / "stage2.txt"))
 TH = json.loads(META.read_text())["threshold"]
+S3 = REPORT.get("stage3", {"mode": "none"}); B3, FM = None, {}
+log(f"stage 3 mode: {S3['mode']} | validation variants: {S3.get('variants')}")
+if S3["mode"] != "none":
+    B3 = lgb.Booster(model_file=str(WORK / "models" / "stage3.txt"))
+if S3["mode"] == "fm":
+    import torch
+    if RUN_MODE == "full" and not torch.cuda.is_available():
+        raise RuntimeError("Stage 3 uses foundation models: switch the Kaggle accelerator to GPU (Settings -> Accelerator) and rerun.")
+    FM = {k: load_fm(k) for k in S3["fm"]}
 COUNTRIES = sorted(TS1.country.unique()); log(f"countries in test (open set): {COUNTRIES} | threshold {TH}")
 DIAG = {}
 for k, c in enumerate(COUNTRIES, 1):
@@ -731,7 +970,7 @@ code(r'''
 banner("WRITING SUBMISSION FILES")
 ids = TS1.entity_id.tolist()
 def collect(kind):
-    parts = [pd.read_parquet(WORK / "ckpt" / f"{c}_{kind}.parquet") for c in COUNTRIES]
+    parts = [pd.read_parquet(WORK / "ckpt" / f"{c}_{MODEL_TAG}_{kind}.parquet") for c in COUNTRIES]
     s = pd.concat(parts).set_index("s1_id").ids
     return s.reindex(ids).fillna("")
 mt, cd = collect("matches"), collect("cands")
