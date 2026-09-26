@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "amazon-entity-resolution"
+version = "0.1.0"
+description = "Amazon ML Challenge 2026 business entity resolution pipeline"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.scripts]
+amazon-er = "entity_resolution.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "code/business_entity_resolution/src"}
+
+[tool.setuptools.packages.find]
+where = ["code/business_entity_resolution/src"]

@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+
+# Generated data and models
+artifacts/*
+!artifacts/.gitkeep
+output/
+*.parquet
+*.joblib
+*.pkl
+
+# Local configuration and editor files
+.env
+.idea/
+.vscode/
