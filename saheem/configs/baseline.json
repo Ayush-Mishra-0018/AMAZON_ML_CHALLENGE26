@@ -1,0 +1,10 @@
+{
+  "seed": 2026,
+  "split": {
+    "train": 0.8,
+    "calibration": 0.1,
+    "holdout": 0.1
+  },
+  "normalization_version": "v1",
+  "metric": "macro_f0.5"
+}
