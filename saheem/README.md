@@ -59,6 +59,21 @@ PYTHONPATH=code/business_entity_resolution/src \
   --output-directory artifacts/train_empty
 ```
 
+## Kaggle execution
+
+Kaggle-specific configuration, runtime setup, and staged notebook conventions are in
+[`kaggle/`](kaggle/README.md). The core implementation is shared with local runs; the
+Kaggle layer only resolves mounted input paths and writable working directories.
+
+Run the local bootstrap smoke test with:
+
+```bash
+python kaggle/scripts/bootstrap.py \
+  --data-root ../../6ab10eb3b23ba_student_resource/student_resource/dataset \
+  --repo-root . \
+  --work-root kaggle/working/amazon-er
+```
+
 ## Data policy
 
 Raw data, cached tables, candidate pairs, models, and predictions are generated

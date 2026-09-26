@@ -1,0 +1,29 @@
+{
+  "schema_version": 1,
+  "purpose": "preprocessing, candidate generation, features, and classical models",
+  "seed": 2026,
+  "runtime": {
+    "accelerator": "none",
+    "internet": false,
+    "workers": 2,
+    "chunk_rows": 200000,
+    "max_memory_fraction": 0.75
+  },
+  "storage": {
+    "format": "parquet",
+    "compression": "zstd",
+    "float_dtype": "float32",
+    "resume_completed_shards": true
+  },
+  "candidate_generation": {
+    "top_k_per_fuzzy_channel": 20,
+    "max_union_candidates": 100,
+    "partition_by_country": true,
+    "process_sources_separately": true
+  },
+  "model": {
+    "family": "hist_gradient_boosting",
+    "early_stopping": true,
+    "metric": "macro_f0.5"
+  }
+}

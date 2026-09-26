@@ -6,10 +6,17 @@ __pycache__/
 # Generated data and models
 artifacts/*
 !artifacts/.gitkeep
-output/
+/output/
 *.parquet
 *.joblib
 *.pkl
+
+# Kaggle runtime products. Keep only directory placeholders in Git.
+kaggle/working/*
+!kaggle/working/.gitkeep
+kaggle/output/*
+!kaggle/output/.gitkeep
+kaggle/**/.ipynb_checkpoints/
 
 # Local configuration and editor files
 .env

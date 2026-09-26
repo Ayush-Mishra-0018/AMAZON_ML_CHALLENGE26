@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "purpose": "optional neural reranking after the classical pipeline is complete",
+  "seed": 2026,
+  "runtime": {
+    "accelerator": "gpu",
+    "internet": false,
+    "mixed_precision": true,
+    "inference_batch_size": 32,
+    "gradient_accumulation_steps": 4
+  },
+  "scope": {
+    "rerank_only": true,
+    "max_candidates_per_entity": 10,
+    "train_on_hard_negatives": true,
+    "fallback_to_classical_score": true
+  },
+  "metric": "macro_f0.5"
+}
