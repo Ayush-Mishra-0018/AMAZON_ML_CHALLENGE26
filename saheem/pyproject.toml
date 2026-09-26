@@ -7,7 +7,14 @@ name = "amazon-entity-resolution"
 version = "0.1.0"
 description = "Amazon ML Challenge 2026 business entity resolution pipeline"
 requires-python = ">=3.11"
-dependencies = []
+dependencies = [
+  "joblib>=1.4,<2",
+  "numpy>=1.26,<3",
+  "pyarrow>=15,<30",
+  "rapidfuzz>=3.9,<4",
+  "scikit-learn>=1.4,<2",
+  "scipy>=1.11,<2",
+]
 
 [project.scripts]
 amazon-er = "entity_resolution.cli:main"

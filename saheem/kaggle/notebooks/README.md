@@ -1,5 +1,8 @@
 # Notebook stages
 
+For a single resumable notebook run, use the copy-paste cells in
+[`RUN_ALL_CELLS.md`](RUN_ALL_CELLS.md).
+
 Keep notebooks thin: resolve paths, load a checked configuration, call package code,
 and save metrics. Put reusable algorithms and tests in the shared Python package.
 
