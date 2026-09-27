@@ -1,8 +1,8 @@
 # ML Challenge 2026: Business Entity Resolution Solution
 
-**Team Name:** [fill in]  
-**Team Members:** [fill in]  
-**Submission Date:** [fill in]
+**Team Name:** DataForge
+**Team Members:** Ayush Mishra (Team Leader), Syed Naveed Mohammed, Md Mudassir Ali, Saheem Showkat Reshi
+**Submission Date:** 27 September 2026
 
 > Status of numbers: values below marked *(prototype)* were measured on the provided training data with prototype scripts. Fill the final validation score from `work/validation_report.json` after running the notebook; do not submit a score that the pipeline's accuracy gate did not produce.
 

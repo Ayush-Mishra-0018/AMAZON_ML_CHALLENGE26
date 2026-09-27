@@ -1,7 +1,7 @@
 # Business Entity Resolution - ML approach summary
 
-**Team:** [FILL BEFORE SUBMISSION]
-**Team members:** [FILL BEFORE SUBMISSION]
+**Team:** DataForge
+**Team members:** Ayush Mishra (Team Leader), Syed Naveed Mohammed, Md Mudassir Ali, Saheem Showkat Reshi
 **Final code commit:** [FILL BEFORE SUBMISSION]
 **Leaderboard submission identifier:** [FILL BEFORE SUBMISSION]
 

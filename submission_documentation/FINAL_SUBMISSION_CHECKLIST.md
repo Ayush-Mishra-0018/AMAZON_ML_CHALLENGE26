@@ -84,9 +84,9 @@ The archive root must not contain an unintended extra parent directory.
 
 ## 7. Final sign-off
 
-**Prepared by:** [FILL BEFORE SUBMISSION]
-**Reviewed by:** [FILL BEFORE SUBMISSION]
-**Date:** [FILL BEFORE SUBMISSION]
+**Prepared by:** DataForge
+**Reviewed by:** Ayush Mishra (Team Leader)
+**Date:** 27 September 2026
 **Final commit:** [FILL BEFORE SUBMISSION]
 **Validator result:** [FILL BEFORE SUBMISSION]
 **Archive SHA-256:** [FILL BEFORE SUBMISSION]
